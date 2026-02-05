@@ -1,202 +1,344 @@
 /*
  * Author: Shakir Salam
- * M24C32 EEPROM I2C Driver + RTC Storage
+ * FRDM-MCXC444 RTC + EEPROM Logger using I2C DMA
+ * Features:
+ * - DMA-based EEPROM read/write
+ * - Ring buffer logging (old logs replaced by new)
+ * - Chronological live view
+ * - Clear logs
+ * - Menu navigation
  */
 
-// Libraries
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
+
 #include "board.h"
 #include "app.h"
 #include "fsl_debug_console.h"
+#include "fsl_rtc.h"
 #include "fsl_i2c.h"
+#include "fsl_i2c_dma.h"
+#include "fsl_dmamux.h"
+#include "fsl_dma.h"
 #include "fsl_port.h"
 #include "fsl_clock.h"
-#include "fsl_rtc.h"
 
-// Definitions
-#define I2C_BAUDRATE		100000U
-#define EEPROM_I2C_ADDR		0x50
-#define	EEPROM_PAGE_SIZE	32
-// EEPROM Memory Address to store RTC
-#define	RTC_EEPROM_ADDR		0x0100
+/***************************
+ * Definitions
+ **************************/
+#define I2C_BAUDRATE           100000U
+#define EEPROM_I2C_ADDR        0x50
+#define EEPROM_PAGE_SIZE       32
+#define EEPROM_LOG_START_ADDR  0x0000
+#define MAX_LOG_ENTRIES        16
 
-// I2C Globals
+#define I2C_DMA_CHANNEL        0
+#define DMA_REQUEST_SRC        kDmaRequestMux0I2C1
+#define OSC_WAIT_TIME_MS       1000UL
+
+/***************************
+ * Structures
+ **************************/
+typedef struct
+{
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
+} rtc_log_t;
+
+#define RTC_LOG_SIZE sizeof(rtc_log_t)
+
+/***************************
+ * Globals
+ **************************/
 i2c_master_config_t masterConfig;
-uint32_t i2c_sourceClock;
+i2c_master_dma_handle_t g_i2cDmaHandle;
+dma_handle_t g_dmaHandle;
 
-// RTC Structure
-typedef struct {
-	uint8_t hours;
-	uint8_t minutes;
-	uint8_t seconds;
-	uint8_t day;
-	uint8_t month;
-	uint16_t year;
-} rtc_time_t;
+volatile bool g_i2cDone = false;
+uint32_t i2cClock;
 
-// I2C Config
-void I2C_Configuration(void)
+uint16_t logIndex = 0;   // Points to next log slot
+uint16_t startIndex = 0; // Points to oldest log
+
+/***************************
+ * DMA Callback
+ **************************/
+static void i2c_dma_callback(I2C_Type *base,
+                             i2c_master_dma_handle_t *handle,
+                             status_t status,
+                             void *userData)
 {
-	CLOCK_EnableClock(kCLOCK_PortC);
-
-	const port_pin_config_t i2c_pin = {
-			kPORT_PullUp,
-			kPORT_FastSlewRate,
-			kPORT_PassiveFilterDisable,
-			kPORT_LowDriveStrength,
-			kPORT_MuxAlt2
-	};
-
-	// PTC1 SDA, PTC2 SCL
-	PORT_SetPinConfig(PORTC, 1U, &i2c_pin);
-	PORT_SetPinConfig(PORTC, 2U, &i2c_pin);
-
-	PRINTF("I2C Pins Configured\r\n");
-}
-
-// I2C Initialization
-void I2C_Init(void)
-{
-	I2C_Configuration();
-
-	I2C_MasterGetDefaultConfig(&masterConfig);
-	masterConfig.baudRate_Bps = I2C_BAUDRATE;
-
-	i2c_sourceClock = CLOCK_GetFreq(I2C1_CLK_SRC);
-	I2C_MasterInit(I2C1, &masterConfig, i2c_sourceClock);
-
-	PRINTF("I2C1 Initialized at %d Hz\r\n", I2C_BAUDRATE);
-}
-
-// EEPROM Functions
-// EEPROM Write
-status_t EEPROM_Write(uint32_t addr, uint16_t memAddr, uint8_t *data, uint16_t length)
-{
-	uint8_t buffer[EEPROM_PAGE_SIZE + 2];
-	i2c_master_transfer_t xfer;
-
-	buffer[0] = (uint8_t)(memAddr >> 8);
-	buffer[1] = (uint8_t)(memAddr & 0xFF);
-	memcpy(&buffer[2], data, length);
-
-	memset(&xfer, 0, sizeof(xfer));
-	xfer.slaveAddress = addr;
-	xfer.direction 	  = kI2C_Write;
-	xfer.data         = buffer;
-	xfer.dataSize     = length + 2;
-	xfer.flags        = kI2C_TransferDefaultFlag;
-
-	return I2C_MasterTransferBlocking(I2C1, &xfer);
-}
-
-// EEPROM Read
-status_t EEPROM_Read(uint8_t addr, uint16_t memAddr, uint8_t *data, uint16_t length)
-{
-	i2c_master_transfer_t xfer;
-
-	memset(&xfer, 0, sizeof(xfer));
-	xfer.slaveAddress   = addr;
-	xfer.direction 	    = kI2C_Read;
-	xfer.subaddress	    = memAddr;
-	xfer.subaddressSize = 2;
-	xfer.data			= data;
-	xfer.dataSize 		= length;
-	xfer.flags 			= kI2C_TransferDefaultFlag;
-
-	return I2C_MasterTransferBlocking(I2C1, &xfer);
-}
-
-// EEPROM Wait
-void EEPROM_WaitReady(uint8_t addr)
-{
-	i2c_master_transfer_t xfer;
-
-	memset(&xfer, 0, sizeof(xfer));
-	xfer.slaveAddress = addr;
-	xfer.direction	  = kI2C_Write;
-	xfer.data		  = NULL;
-	xfer.dataSize 	  = 0;
-
-	while (I2C_MasterTransferBlocking(I2C1, &xfer) != kStatus_Success);
-}
-
-// RTC to EEPROM
-void RTC_ToBytes(rtc_time_t *rtc, uint8_t *data)
-{
-    data[0] = rtc->hours;
-    data[1] = rtc->minutes;
-    data[2] = rtc->seconds;
-    data[3] = rtc->day;
-    data[4] = rtc->month;
-    data[5] = (rtc->year >> 8) & 0xFF;
-    data[6] = rtc->year & 0xFF;
-}
-
-void EEPROM_StoreRTC(rtc_datetime_t *rtcDate)
-{
-    rtc_time_t rtc;
-    uint8_t rtcData[7];
-
-    rtc.hours = rtcDate->hour;
-    rtc.minutes = rtcDate->minute;
-    rtc.seconds = rtcDate->second;
-    rtc.day = rtcDate->day;
-    rtc.month = rtcDate->month;
-    rtc.year = rtcDate->year;
-
-    RTC_ToBytes(&rtc, rtcData);
-
-    if (EEPROM_Write(EEPROM_I2C_ADDR, RTC_EEPROM_ADDR, rtcData, sizeof(rtcData)) == kStatus_Success)
+    if (status == kStatus_Success)
     {
-        EEPROM_WaitReady(EEPROM_I2C_ADDR);
-        PRINTF("RTC Stored to EEPROM\r\n");
-    }
-    else
-    {
-        PRINTF("RTC Store Failed\r\n");
+        g_i2cDone = true;
     }
 }
 
+/***************************
+ * OSC Wait
+ **************************/
+static void EXAMPLE_WaitOSCReady(uint32_t delay_ms)
+{
+    uint32_t ticks = SystemCoreClock / 1000U;
+    SysTick->LOAD = ticks - 1U;
+    SysTick->VAL  = 0U;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
+
+    for (uint32_t i = 0; i < delay_ms; i++)
+    {
+        while (!(SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk)) {}
+    }
+
+    SysTick->CTRL = 0;
+}
+
+/***************************
+ * I2C + DMA Init
+ **************************/
+void I2C_DMA_Init(void)
+{
+    CLOCK_EnableClock(kCLOCK_PortC);
+
+    port_pin_config_t pinConfig = {
+        kPORT_PullUp,
+        kPORT_FastSlewRate,
+        kPORT_PassiveFilterDisable,
+        kPORT_LowDriveStrength,
+        kPORT_MuxAlt2
+    };
+
+    PORT_SetPinConfig(PORTC, 1U, &pinConfig); // SDA
+    PORT_SetPinConfig(PORTC, 2U, &pinConfig); // SCL
+
+    I2C_MasterGetDefaultConfig(&masterConfig);
+    masterConfig.baudRate_Bps = I2C_BAUDRATE;
+
+    i2cClock = CLOCK_GetFreq(I2C1_CLK_SRC);
+    I2C_MasterInit(I2C1, &masterConfig, i2cClock);
+
+    DMAMUX_Init(DMAMUX0);
+    DMA_Init(DMA0);
+
+    DMAMUX_SetSource(DMAMUX0, I2C_DMA_CHANNEL, DMA_REQUEST_SRC);
+    DMAMUX_EnableChannel(DMAMUX0, I2C_DMA_CHANNEL);
+
+    DMA_CreateHandle(&g_dmaHandle, DMA0, I2C_DMA_CHANNEL);
+
+    I2C_MasterTransferCreateHandleDMA(
+        I2C1,
+        &g_i2cDmaHandle,
+        i2c_dma_callback,
+        NULL,
+        &g_dmaHandle
+    );
+
+    PRINTF("I2C DMA Initialized\r\n");
+}
+
+/***************************
+ * EEPROM DMA Functions
+ **************************/
+void EEPROM_WriteDMA(uint16_t memAddr, uint8_t *data, uint16_t len)
+{
+    uint8_t buffer[EEPROM_PAGE_SIZE + 2];
+    i2c_master_transfer_t xfer;
+
+    buffer[0] = memAddr >> 8;
+    buffer[1] = memAddr & 0xFF;
+    memcpy(&buffer[2], data, len);
+
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.slaveAddress = EEPROM_I2C_ADDR;
+    xfer.direction    = kI2C_Write;
+    xfer.data         = buffer;
+    xfer.dataSize     = len + 2;
+    xfer.flags        = kI2C_TransferDefaultFlag;
+
+    g_i2cDone = false;
+    I2C_MasterTransferDMA(I2C1, &g_i2cDmaHandle, &xfer);
+    while (!g_i2cDone) {}
+}
+
+void EEPROM_ReadDMA(uint16_t memAddr, uint8_t *data, uint16_t len)
+{
+    i2c_master_transfer_t xfer;
+
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.slaveAddress   = EEPROM_I2C_ADDR;
+    xfer.direction      = kI2C_Read;
+    xfer.subaddress     = memAddr;
+    xfer.subaddressSize = 2;
+    xfer.data           = data;
+    xfer.dataSize       = len;
+    xfer.flags          = kI2C_TransferDefaultFlag;
+
+    g_i2cDone = false;
+    I2C_MasterTransferDMA(I2C1, &g_i2cDmaHandle, &xfer);
+    while (!g_i2cDone) {}
+}
+
+/***************************
+ * EEPROM Utilities
+ **************************/
+void EEPROM_ClearAllLogs(void)
+{
+    rtc_log_t empty = {0};
+
+    for (uint16_t i = 0; i < MAX_LOG_ENTRIES; i++)
+    {
+        EEPROM_WriteDMA(
+            EEPROM_LOG_START_ADDR + i * RTC_LOG_SIZE,
+            (uint8_t *)&empty,
+            RTC_LOG_SIZE
+        );
+        SDK_DelayAtLeastUs(5000U, SystemCoreClock);
+    }
+
+    logIndex = 0;
+    startIndex = 0;
+    PRINTF("EEPROM logs cleared!\r\n");
+}
+
+/***************************
+ * RTC Log Functions
+ **************************/
+void EEPROM_SaveRTC(rtc_datetime_t *dt)
+{
+    rtc_log_t log = {
+        dt->year, dt->month, dt->day,
+        dt->hour, dt->minute, dt->second
+    };
+
+    EEPROM_WriteDMA(
+        EEPROM_LOG_START_ADDR + logIndex * RTC_LOG_SIZE,
+        (uint8_t *)&log,
+        RTC_LOG_SIZE
+    );
+
+    // Update ring buffer indices
+    logIndex = (logIndex + 1) % MAX_LOG_ENTRIES;
+    if (logIndex == startIndex)
+    {
+        startIndex = (startIndex + 1) % MAX_LOG_ENTRIES; // overwrite oldest
+    }
+}
+
+void EEPROM_ReadRTC(uint16_t index, rtc_log_t *log)
+{
+    EEPROM_ReadDMA(
+        EEPROM_LOG_START_ADDR + index * RTC_LOG_SIZE,
+        (uint8_t *)log,
+        RTC_LOG_SIZE
+    );
+}
+
+/***************************
+ * Menu
+ **************************/
+void ShowMenu(void)
+{
+    PRINTF("\r\n===== MENU =====\r\n");
+    PRINTF("1 - Show current time (log it)\r\n");
+    PRINTF("2 - View EEPROM logs (chronological)\r\n");
+    PRINTF("3 - Clear all EEPROM logs\r\n");
+    PRINTF("> ");
+}
+
+/***************************
+ * Main
+ **************************/
 int main(void)
 {
-    BOARD_InitHardware();
-    PRINTF("M24C32 EEPROM + RTC Example\r\n");
-
-    // Initialize I2C for EEPROM
-    I2C_Init();
-
-    // Initialize RTC
     rtc_config_t rtcConfig;
+    rtc_datetime_t now;
+    rtc_log_t log;
+    char cmd;
+
+    BOARD_InitHardware();
+    I2C_DMA_Init();
+
     RTC_GetDefaultConfig(&rtcConfig);
     RTC_Init(RTC, &rtcConfig);
 
-    rtc_datetime_t date;
-    date.year = 2026;
-    date.month = 2;
-    date.day = 3;
-    date.hour = 4;
-    date.minute = 24;
-    date.second = 0;
+#if !(defined(FSL_FEATURE_RTC_HAS_NO_CR_OSCE) && FSL_FEATURE_RTC_HAS_NO_CR_OSCE)
+    if (!(RTC->CR & RTC_CR_OSCE_MASK))
+    {
+        RTC_SetClockSource(RTC);
+        EXAMPLE_WaitOSCReady(OSC_WAIT_TIME_MS);
+    }
+#endif
 
-    RTC_StopTimer(RTC);
-    RTC_SetDatetime(RTC, &date);
+    rtc_datetime_t startTime = {2026, 2, 4, 3, 0, 0};
+    RTC_SetDatetime(RTC, &startTime);
     RTC_StartTimer(RTC);
 
-    // Infinite loop: read RTC and store to EEPROM
+    PRINTF("\r\nRTC + EEPROM DMA LOGGER READY\r\n");
+
     while (1)
     {
-        // Read current RTC
-        RTC_GetDatetime(RTC, &date);
+        ShowMenu();
+        cmd = GETCHAR();
+        PRINTF("%c\r\n", cmd);
 
-        PRINTF("Current RTC: %04d-%02d-%02d %02d:%02d:%02d\r\n",
-               date.year, date.month, date.day,
-               date.hour, date.minute, date.second);
+        /* OPTION 1: Log current time */
+        if (cmd == '1')
+        {
+            RTC_GetDatetime(RTC, &now);
+            PRINTF("Current: %04d-%02d-%02d %02d:%02d:%02d\r\n",
+                   now.year, now.month, now.day,
+                   now.hour, now.minute, now.second);
 
-        // Store RTC to EEPROM
-        EEPROM_StoreRTC(&date);
+            EEPROM_SaveRTC(&now);
+        }
 
-        // Optional delay: store once per second
-        for (volatile uint32_t i = 0; i < 3000000; i++); // crude delay
+        /* OPTION 2: View logs live */
+        else if (cmd == '2')
+        {
+            PRINTF("\r\nView EEPROM Logs (ESC or 'q' + ENTER to return)\r\n");
+
+            while (1)
+            {
+                PRINTF("\033[2J\033[H"); // Clear screen
+
+                PRINTF("---- EEPROM LOGS (CHRONOLOGICAL) ----\r\n");
+
+                for (uint16_t i = 0; i < MAX_LOG_ENTRIES; i++)
+                {
+                    uint16_t index = (startIndex + i) % MAX_LOG_ENTRIES;
+                    EEPROM_ReadRTC(index, &log);
+
+                    // Skip empty logs
+                    if (log.year == 0 && log.month == 0) continue;
+
+                    PRINTF("[%02d] %04d-%02d-%02d %02d:%02d:%02d\r\n",
+                           index,
+                           log.year, log.month, log.day,
+                           log.hour, log.minute, log.second);
+                }
+
+                PRINTF("\r\nPress ESC or 'q' + ENTER to return...\r\n");
+
+                cmd = GETCHAR();
+                if (cmd == 'q' || cmd == 27)
+                {
+                    PRINTF("\r\nExit log view\r\n");
+                    break;
+                }
+
+                SDK_DelayAtLeastUs(500000U, SystemCoreClock); // 0.5s refresh
+            }
+        }
+
+        /* OPTION 3: Clear all logs */
+        else if (cmd == '3')
+        {
+            EEPROM_ClearAllLogs();
+            PRINTF("Returning to menu...\r\n");
+        }
     }
 }
